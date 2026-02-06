@@ -1,5 +1,6 @@
 """Generic speaker scraper for event websites."""
 
+import json
 import logging
 import re
 from typing import Optional
@@ -11,6 +12,59 @@ from bs4 import BeautifulSoup
 from models import Speaker
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_nextjs_speakers(html: str, url: str) -> list[Speaker]:
+    """Extract speakers from Next.js __NEXT_DATA__ JSON."""
+    match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html,
+        re.DOTALL
+    )
+    if not match:
+        return []
+
+    try:
+        data = json.loads(match.group(1))
+        props = data.get("props", {}).get("pageProps", {})
+    except json.JSONDecodeError:
+        return []
+
+    speakers_data = props.get("speakers", [])
+    if not speakers_data:
+        return []
+
+    logger.info(f"Found Next.js data with {len(speakers_data)} speakers")
+
+    speakers = []
+    for s in speakers_data:
+        name = s.get("title") or s.get("name") or s.get("fullName")
+        if not name:
+            continue
+
+        # Handle custom_fields structure (Blockworks pattern)
+        cf = s.get("custom_fields", {})
+
+        job_field = cf.get("speaker_job", {})
+        title = job_field.get("value") if isinstance(job_field, dict) else None
+
+        company_field = cf.get("speaker_company", {})
+        company = company_field.get("value") if isinstance(company_field, dict) else None
+
+        # Fallback to direct fields
+        if not title:
+            title = s.get("tagLine") or s.get("title_position") or s.get("jobTitle")
+        if not company:
+            company = s.get("company") or s.get("organization")
+
+        speakers.append(Speaker(
+            name=name,
+            title=title,
+            company=company,
+            source_url=url
+        ))
+
+    return speakers
 
 # Common CSS selectors for speaker sections
 SPEAKER_SELECTORS = [
@@ -100,6 +154,12 @@ def scrape_speakers(url: str) -> list[Speaker]:
     except requests.RequestException as e:
         logger.error(f"Failed to fetch URL: {e}")
         return []
+
+    # Try Next.js data extraction first (for React-based sites)
+    nextjs_speakers = _extract_nextjs_speakers(response.text, url)
+    if nextjs_speakers:
+        logger.info(f"Extracted {len(nextjs_speakers)} speakers from Next.js data")
+        return nextjs_speakers
 
     soup = BeautifulSoup(response.text, "html.parser")
     speakers = []
