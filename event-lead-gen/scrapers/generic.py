@@ -1,0 +1,330 @@
+"""Generic speaker scraper for event websites."""
+
+import logging
+import re
+from typing import Optional
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
+
+from models import Speaker
+
+logger = logging.getLogger(__name__)
+
+# Common CSS selectors for speaker sections
+SPEAKER_SELECTORS = [
+    # Class-based patterns
+    ".speaker",
+    ".speaker-card",
+    ".speaker-item",
+    ".speakers-item",
+    ".team-member",
+    ".speaker-box",
+    ".speaker-block",
+    ".person",
+    ".person-card",
+    # ID-based patterns
+    "[class*='speaker']",
+    "[class*='Speaker']",
+    # Semantic patterns
+    "article.speaker",
+    "div[data-speaker]",
+    # Elementor patterns (common in WordPress sites)
+    ".elementor-col-16",
+    ".elementor-col-20",
+    ".elementor-col-25",
+    ".elementor-col-33",
+]
+
+# Patterns for name extraction
+NAME_SELECTORS = [
+    ".speaker-name",
+    ".name",
+    "h3",
+    "h4",
+    "h2",
+    ".title",
+    "[class*='name']",
+    "strong",
+]
+
+# Patterns for title/role extraction
+TITLE_SELECTORS = [
+    ".speaker-title",
+    ".speaker-role",
+    ".role",
+    ".position",
+    ".job-title",
+    "[class*='title']",
+    "[class*='role']",
+    "[class*='position']",
+    "p",
+    "span",
+]
+
+# Patterns for company extraction
+COMPANY_SELECTORS = [
+    ".speaker-company",
+    ".company",
+    ".organization",
+    ".org",
+    "[class*='company']",
+    "[class*='organization']",
+]
+
+
+def scrape_speakers(url: str) -> list[Speaker]:
+    """
+    Scrape speaker information from an event page.
+
+    Args:
+        url: The URL of the speakers page
+
+    Returns:
+        List of Speaker objects with name, title, and company
+    """
+    logger.info(f"Scraping speakers from: {url}")
+
+    # Use realistic browser headers to avoid blocks
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        session = requests.Session()
+        response = session.get(url, headers=headers, timeout=30, allow_redirects=True)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch URL: {e}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    speakers = []
+
+    # Try each selector pattern to find speaker cards
+    speaker_cards = []
+    for selector in SPEAKER_SELECTORS:
+        try:
+            cards = soup.select(selector)
+            if cards:
+                logger.debug(f"Found {len(cards)} elements with selector: {selector}")
+                speaker_cards = cards
+                break
+        except Exception:
+            continue
+
+    if not speaker_cards:
+        logger.warning("No speaker cards found with standard selectors. Trying fallback...")
+        speaker_cards = _fallback_speaker_detection(soup)
+
+    for card in speaker_cards:
+        speaker = _extract_speaker_from_card(card, url)
+        if speaker and speaker.name:
+            speakers.append(speaker)
+
+    # Deduplicate by name
+    seen_names = set()
+    unique_speakers = []
+    for speaker in speakers:
+        normalized_name = speaker.name.lower().strip()
+        if normalized_name not in seen_names:
+            seen_names.add(normalized_name)
+            unique_speakers.append(speaker)
+
+    logger.info(f"Extracted {len(unique_speakers)} unique speakers")
+    return unique_speakers
+
+
+def _fallback_speaker_detection(soup: BeautifulSoup) -> list:
+    """
+    Fallback detection for non-standard speaker layouts.
+    Looks for repeated structures with person-like content.
+    """
+    candidates = []
+
+    # Look for divs/articles with images and text that could be speakers
+    for container in soup.find_all(["div", "article", "li", "section"]):
+        # Check if it has an image and some text
+        has_image = container.find("img") is not None
+        text_content = container.get_text(strip=True)
+
+        # Heuristic: speaker cards usually have 20-500 chars of text
+        if has_image and 20 < len(text_content) < 500:
+            # Check if parent has multiple similar children (grid pattern)
+            parent = container.parent
+            if parent:
+                siblings = parent.find_all(container.name, recursive=False)
+                if len(siblings) >= 3:  # Likely a speaker grid
+                    candidates.extend(siblings)
+                    break
+
+    return candidates
+
+
+def _extract_speaker_from_card(card, source_url: str) -> Optional[Speaker]:
+    """Extract speaker information from a card element."""
+    name = None
+    title = None
+    company = None
+
+    # Check if this is an Elementor column (WordPress page builder)
+    is_elementor = any("elementor" in c for c in card.get("class", []))
+
+    if is_elementor:
+        # Elementor pattern: H2[0] = Name, Text widget = Title, H2[1] = Company
+        h2_elements = card.find_all("h2", class_="elementor-heading-title")
+        h2_texts = [h.get_text(strip=True).rstrip("\u200b") for h in h2_elements]
+
+        # Get text widget content (job titles)
+        text_widgets = card.select(".elementor-widget-text-editor")
+        widget_texts = [w.get_text(strip=True) for w in text_widgets if w.get_text(strip=True)]
+
+        # First H2 is always the name
+        if h2_texts:
+            name = h2_texts[0]
+
+        # Second H2 is always the company (if exists)
+        if len(h2_texts) > 1:
+            company = h2_texts[1]
+
+        # Text widget is the job title
+        if widget_texts:
+            title = widget_texts[0]
+
+        if not name:
+            return None
+
+        return Speaker(
+            name=name,
+            title=title,
+            company=company,
+            source_url=source_url
+        )
+
+    # Standard extraction for non-Elementor sites
+    # Extract name
+    for selector in NAME_SELECTORS:
+        try:
+            elem = card.select_one(selector)
+            if elem:
+                text = elem.get_text(strip=True)
+                # Name should be 2-50 chars and look like a name
+                if 2 < len(text) < 50 and _looks_like_name(text):
+                    name = text
+                    break
+        except Exception:
+            continue
+
+    # If no name found via selectors, try first significant text
+    if not name:
+        for elem in card.find_all(["h2", "h3", "h4", "strong", "b"]):
+            text = elem.get_text(strip=True)
+            if 2 < len(text) < 50 and _looks_like_name(text):
+                name = text
+                break
+
+    if not name:
+        return None
+
+    # Extract title and company
+    all_text_parts = []
+    for elem in card.find_all(["p", "span", "div"]):
+        text = elem.get_text(strip=True)
+        if text and text != name and len(text) < 200:
+            all_text_parts.append(text)
+
+    # Try specific selectors for title
+    for selector in TITLE_SELECTORS:
+        try:
+            elem = card.select_one(selector)
+            if elem:
+                text = elem.get_text(strip=True)
+                if text and text != name and len(text) < 100:
+                    title = text
+                    break
+        except Exception:
+            continue
+
+    # Try specific selectors for company
+    for selector in COMPANY_SELECTORS:
+        try:
+            elem = card.select_one(selector)
+            if elem:
+                text = elem.get_text(strip=True)
+                if text and text != name and text != title:
+                    company = text
+                    break
+        except Exception:
+            continue
+
+    # If no explicit company, try to parse from title (common format: "CEO at Company")
+    if not company and title:
+        company = _extract_company_from_title(title)
+
+    # If still no title/company, use first text parts
+    if not title and all_text_parts:
+        title = all_text_parts[0]
+    if not company and len(all_text_parts) > 1:
+        company = all_text_parts[1]
+
+    return Speaker(
+        name=name,
+        title=title,
+        company=company,
+        source_url=source_url
+    )
+
+
+def _looks_like_name(text: str) -> bool:
+    """Check if text looks like a person's name."""
+    # Should have at least 2 words (first + last name)
+    words = text.split()
+    if len(words) < 2:
+        return False
+
+    # Should not be too long (likely a title or description)
+    if len(words) > 5:
+        return False
+
+    # Should not contain common non-name words
+    non_name_words = ["the", "and", "of", "at", "for", "in", "on", "@", "&", "|"]
+    if any(w.lower() in non_name_words for w in words):
+        return False
+
+    # Should not contain company-related words
+    company_words = [
+        "capital", "management", "labs", "ventures", "partners", "group",
+        "inc", "corp", "llc", "ltd", "foundation", "fund", "bank", "finance",
+        "consulting", "advisory", "holdings", "investments", "asset", "assets",
+        "digital", "crypto", "blockchain", "network", "protocol", "exchange",
+        "technology", "technologies", "solutions", "services", "global",
+        "international", "institute", "association", "council", "chamber",
+    ]
+    if any(w.lower() in company_words for w in words):
+        return False
+
+    # Should start with capital letter
+    if not text[0].isupper():
+        return False
+
+    return True
+
+
+def _extract_company_from_title(title: str) -> Optional[str]:
+    """Extract company name from title like 'CEO at Company' or 'CEO, Company'."""
+    patterns = [
+        r"(?:at|@)\s+(.+)$",           # "CEO at Company"
+        r",\s+(.+)$",                   # "CEO, Company"
+        r"\|\s*(.+)$",                  # "CEO | Company"
+        r"-\s+(.+)$",                   # "CEO - Company"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, title, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    return None
