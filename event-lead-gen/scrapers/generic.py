@@ -14,6 +14,86 @@ from models import Speaker
 logger = logging.getLogger(__name__)
 
 
+def _extract_sitemap_speakers(base_url: str, headers: dict) -> list[Speaker]:
+    """Extract speakers from sitemap (for JS-rendered sites like Coindesk events)."""
+    parsed = urlparse(base_url)
+    sitemap_url = f"{parsed.scheme}://{parsed.netloc}/sitemap.xml"
+
+    try:
+        r = requests.get(sitemap_url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return []
+    except requests.RequestException:
+        return []
+
+    # Find sitemap index
+    sitemap_match = re.search(r'<loc>([^<]+sitemap[^<]+\.xml)</loc>', r.text)
+    if sitemap_match:
+        sitemap_url = sitemap_match.group(1)
+        try:
+            r = requests.get(sitemap_url, headers=headers, timeout=30)
+        except requests.RequestException:
+            return []
+
+    # Find speaker page URLs (pattern: /agenda/speaker/ or /speaker/)
+    speaker_urls = re.findall(r'<loc>([^<]*/(?:agenda/)?speaker/[^<]+)</loc>', r.text)
+    # Filter out non-individual pages
+    speaker_urls = [u for u in speaker_urls if u.count('/') > 4]
+
+    if not speaker_urls:
+        return []
+
+    logger.info(f"Found {len(speaker_urls)} speaker pages in sitemap, scraping...")
+
+    speakers = []
+    for i, url in enumerate(speaker_urls):
+        if i > 0 and i % 50 == 0:
+            logger.info(f"  Scraped {i}/{len(speaker_urls)} speakers...")
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Extract name from H1
+            h1 = soup.find("h1")
+            if not h1:
+                continue
+            name = h1.get_text(strip=True)
+            if not name or len(name) < 2:
+                continue
+
+            # Extract title and company from H2 elements
+            h2s = soup.find_all("h2")
+            h2_texts = [h.get_text(strip=True) for h in h2s if h.get_text(strip=True)]
+
+            title = h2_texts[0] if h2_texts else None
+            company = h2_texts[1] if len(h2_texts) > 1 else None
+
+            # Fallback: extract company from meta description
+            if not company:
+                meta = soup.find("meta", {"name": "description"})
+                if meta:
+                    desc = meta.get("content", "")
+                    match = re.search(r'(?:of|at|from)\s+([^,\.]+)', desc)
+                    if match:
+                        company = match.group(1).strip()
+
+            speakers.append(Speaker(
+                name=name,
+                title=title,
+                company=company,
+                source_url=url
+            ))
+
+        except requests.RequestException:
+            continue
+
+    return speakers
+
+
 def _extract_nextjs_speakers(html: str, url: str) -> list[Speaker]:
     """Extract speakers from Next.js __NEXT_DATA__ JSON."""
     match = re.search(
@@ -193,6 +273,14 @@ def scrape_speakers(url: str) -> list[Speaker]:
         if normalized_name not in seen_names:
             seen_names.add(normalized_name)
             unique_speakers.append(speaker)
+
+    # If no speakers found, try sitemap extraction (for JS-rendered sites)
+    if len(unique_speakers) <= 1:
+        logger.info("Trying sitemap extraction for JS-rendered site...")
+        sitemap_speakers = _extract_sitemap_speakers(url, headers)
+        if sitemap_speakers:
+            logger.info(f"Extracted {len(sitemap_speakers)} speakers from sitemap")
+            return sitemap_speakers
 
     logger.info(f"Extracted {len(unique_speakers)} unique speakers")
     return unique_speakers
