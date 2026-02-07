@@ -534,6 +534,31 @@ def scrape_speakers(url: str) -> list[Speaker]:
     """
     logger.info(f"Scraping speakers from: {url}")
 
+    # Check for site-specific scrapers
+    if "coindesk.com" in url:
+        from scrapers.consensus_scraper import scrape_consensus_speakers
+        speakers = scrape_consensus_speakers(url)
+        if speakers:
+            return speakers
+
+    if "dcblockchainsummit.com" in url:
+        from scrapers.dcblockchainsummit_scraper import scrape_dcblockchainsummit_speakers
+        speakers = scrape_dcblockchainsummit_speakers(url)
+        if speakers:
+            return speakers
+
+    if "btcprague.com" in url:
+        from scrapers.btcprague_scraper import scrape_btcprague_speakers
+        speakers = scrape_btcprague_speakers(url)
+        if speakers:
+            return speakers
+
+    if "ethdenver.com" in url:
+        from scrapers.ethdenver_scraper import scrape_ethdenver_speakers
+        speakers = scrape_ethdenver_speakers(url)
+        if speakers:
+            return speakers
+
     # Use realistic browser headers to avoid blocks
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
