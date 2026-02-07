@@ -202,3 +202,122 @@ def export_to_existing_sheet(
     print(f"\nGoogle Sheet URL: {spreadsheet.url}")
 
     return len(speakers)
+
+
+def update_existing_worksheet(
+    speakers: list[Speaker],
+    spreadsheet_id: str,
+    worksheet_name: str,
+    source_event: Optional[str] = None
+) -> int:
+    """
+    Update an existing worksheet (clears and replaces all data).
+
+    Args:
+        speakers: List of Speaker objects to export
+        spreadsheet_id: ID of existing spreadsheet
+        worksheet_name: Name of the worksheet to update
+        source_event: Event name to include in Source Event column
+
+    Returns:
+        Number of speakers exported
+    """
+    import gspread
+
+    if not speakers:
+        logger.info("No speakers to export")
+        return 0
+
+    source_event = source_event or worksheet_name
+
+    logger.info(f"Updating worksheet '{worksheet_name}'...")
+
+    try:
+        client = get_sheets_client()
+        spreadsheet = client.open_by_key(spreadsheet_id)
+    except Exception as e:
+        logger.error(f"Failed to open spreadsheet: {e}")
+        raise
+
+    # Get existing worksheet
+    try:
+        sheet = spreadsheet.worksheet(worksheet_name)
+    except gspread.WorksheetNotFound:
+        logger.error(f"Worksheet '{worksheet_name}' not found")
+        raise
+
+    # Clear existing data
+    sheet.clear()
+
+    # Add headers
+    sheet.append_row(HEADERS)
+
+    # Format and add speaker rows
+    rows = format_speakers_for_sheets(speakers, source_event)
+    if rows:
+        sheet.append_rows(rows)
+
+    logger.info(f"Updated {len(speakers)} speakers in worksheet '{worksheet_name}'")
+
+    return len(speakers)
+
+
+def read_speakers_from_worksheet(
+    spreadsheet_id: str,
+    worksheet_name: str
+) -> list[Speaker]:
+    """
+    Read speakers from an existing worksheet.
+
+    Args:
+        spreadsheet_id: ID of the spreadsheet
+        worksheet_name: Name of the worksheet to read
+
+    Returns:
+        List of Speaker objects
+    """
+    import gspread
+
+    try:
+        client = get_sheets_client()
+        spreadsheet = client.open_by_key(spreadsheet_id)
+        sheet = spreadsheet.worksheet(worksheet_name)
+    except Exception as e:
+        logger.error(f"Failed to open worksheet: {e}")
+        raise
+
+    # Get all values
+    values = sheet.get_all_values()
+    if len(values) < 2:
+        return []
+
+    headers = values[0]
+    speakers = []
+
+    # Find column indices
+    col_map = {h: i for i, h in enumerate(headers)}
+
+    for row in values[1:]:
+        if not row or not any(row):
+            continue
+
+        first_name = row[col_map.get("First Name", 0)] if col_map.get("First Name") is not None and len(row) > col_map.get("First Name", 0) else ""
+        last_name = row[col_map.get("Last Name", 1)] if col_map.get("Last Name") is not None and len(row) > col_map.get("Last Name", 1) else ""
+        email = row[col_map.get("Email", 2)] if col_map.get("Email") is not None and len(row) > col_map.get("Email", 2) else ""
+        title = row[col_map.get("Job Title", 3)] if col_map.get("Job Title") is not None and len(row) > col_map.get("Job Title", 3) else ""
+        company = row[col_map.get("Company Name", 4)] if col_map.get("Company Name") is not None and len(row) > col_map.get("Company Name", 4) else ""
+        linkedin = row[col_map.get("LinkedIn URL", 5)] if col_map.get("LinkedIn URL") is not None and len(row) > col_map.get("LinkedIn URL", 5) else ""
+        twitter = row[col_map.get("Twitter URL", 6)] if col_map.get("Twitter URL") is not None and len(row) > col_map.get("Twitter URL", 6) else ""
+
+        name = f"{first_name} {last_name}".strip()
+
+        speakers.append(Speaker(
+            name=name,
+            title=title,
+            company=company,
+            email=email,
+            linkedin_url=linkedin,
+            twitter_url=twitter
+        ))
+
+    return speakers

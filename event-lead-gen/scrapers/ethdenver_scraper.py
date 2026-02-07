@@ -76,24 +76,24 @@ def scrape_ethdenver_speakers(url: str) -> list[Speaker]:
 
             soup = BeautifulSoup(r.text, "html.parser")
 
-            # Find name from H3 or title
-            name = None
-            for h3 in soup.find_all("h3"):
-                text = h3.get_text(strip=True)
-                if text and len(text) > 2 and text not in ["Venue:", "Follow us:", "Contributor agreement"]:
-                    name = text
-                    break
+            # Find speaker info from Elementor heading widgets
+            # Structure: 1st = Name, 2nd = Company, 3rd = Title
+            headings = soup.find_all(class_=lambda x: x and "elementor-heading" in str(x))
+            heading_texts = [h.get_text(strip=True) for h in headings]
 
-            if not name:
-                title_tag = soup.find("title")
-                if title_tag:
-                    name = title_tag.get_text(strip=True).split(" - ")[0].strip()
+            # Filter out non-speaker headings
+            skip_texts = ["other speakers", "venue:", "follow us:", "contributor agreement"]
+            heading_texts = [h for h in heading_texts if h.lower() not in skip_texts and len(h) > 1]
 
-            if not name or len(name) < 2:
+            if not heading_texts:
                 continue
 
-            # Extract name from URL as fallback
-            if name == "LVC at the National Western Center":
+            name = heading_texts[0]
+            company = heading_texts[1] if len(heading_texts) > 1 else ""
+            title = heading_texts[2] if len(heading_texts) > 2 else ""
+
+            # Skip if name looks like a section header
+            if name == "LVC at the National Western Center" or len(name) < 2:
                 url_name = speaker_url.rstrip("/").split("/")[-1]
                 name = url_name.replace("-", " ").title()
 
@@ -109,6 +109,8 @@ def scrape_ethdenver_speakers(url: str) -> list[Speaker]:
 
             speakers.append(Speaker(
                 name=name,
+                company=company,
+                title=title,
                 twitter_url=twitter_url,
                 linkedin_url=linkedin_url,
                 source_url=speaker_url
