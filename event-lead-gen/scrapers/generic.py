@@ -559,6 +559,12 @@ def scrape_speakers(url: str) -> list[Speaker]:
         if speakers:
             return speakers
 
+    if "web3hubdavos.com" in url:
+        from scrapers.web3hubdavos_scraper import scrape_web3hubdavos_speakers
+        speakers = scrape_web3hubdavos_speakers(url)
+        if speakers:
+            return speakers
+
     # Use realistic browser headers to avoid blocks
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
