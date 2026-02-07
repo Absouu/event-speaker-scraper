@@ -16,6 +16,7 @@ HEADERS = [
     "Job Title",
     "Company Name",
     "LinkedIn URL",
+    "Twitter URL",
     "Source Event"
 ]
 
@@ -72,6 +73,7 @@ def format_speakers_for_sheets(
             sanitize_for_sheets(speaker.title),
             sanitize_for_sheets(speaker.company),
             sanitize_for_sheets(speaker.linkedin_url),
+            sanitize_for_sheets(speaker.twitter_url),
             sanitize_for_sheets(source_event),
         ]
         rows.append(row)

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import time
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -12,6 +13,319 @@ from bs4 import BeautifulSoup
 from models import Speaker
 
 logger = logging.getLogger(__name__)
+
+# Check if Playwright is available
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logger.debug("Playwright not installed - JS-rendered sites with infinite scroll won't be fully supported")
+
+
+def _extract_social_links(card) -> tuple[Optional[str], Optional[str]]:
+    """Extract Twitter and LinkedIn URLs from a card element."""
+    twitter_url = None
+    linkedin_url = None
+
+    # Find all links in the card
+    links = card.find_all("a", href=True)
+    for link in links:
+        href = link.get("href", "")
+        if "twitter.com/" in href or "x.com/" in href:
+            twitter_url = href
+        elif "linkedin.com/" in href:
+            linkedin_url = href
+
+    return twitter_url, linkedin_url
+
+
+def _scrape_with_playwright(url: str, scroll_pause: float = 1.0, max_scrolls: int = 50) -> list[Speaker]:
+    """
+    Use Playwright to scrape JS-rendered pages with infinite scroll.
+    Extracts speaker data including social links.
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        logger.warning("Playwright not available for JS rendering")
+        return []
+
+    logger.info(f"Using Playwright to scrape: {url}")
+    speakers = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle", timeout=60000)
+
+            # Scroll to load all content - use image count as indicator
+            scroll_count = 0
+            last_card_count = 0
+            while scroll_count < max_scrolls:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(scroll_pause)
+
+                # Count profile images as proxy for loaded content
+                try:
+                    card_count = page.locator("img[src*='profile'], img[alt*='Profile'], img[alt*='Speaker'], .speaker-card, .speaker").count()
+                except Exception:
+                    card_count = 0
+
+                if card_count == last_card_count and scroll_count > 5:
+                    # No new content after multiple scrolls
+                    break
+                last_card_count = card_count
+                scroll_count += 1
+
+                if scroll_count % 10 == 0:
+                    logger.info(f"  Scrolled {scroll_count} times, {card_count} cards loaded...")
+
+            logger.info(f"Finished scrolling after {scroll_count} scrolls, {last_card_count} cards")
+
+            # Get the fully loaded HTML
+            html = page.content()
+            browser.close()
+
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Try EthCC-style cards first (directional-hover-card with profile photos)
+            cards = soup.find_all("div", class_=lambda x: x and "directional-hover-card" in x and "group" in x)
+            if cards:
+                logger.info(f"Found {len(cards)} EthCC-style speaker cards")
+                for card in cards:
+                    speaker = _extract_ethcc_speaker(card, url)
+                    if speaker:
+                        speakers.append(speaker)
+                if speakers:
+                    return _dedupe_speakers(speakers)
+
+            # Try to extract from Next.js streamed data
+            streamed = _extract_nextjs_streamed_speakers(html, url)
+            if streamed:
+                return streamed
+
+            # Fall back to standard DOM parsing
+            for selector in SPEAKER_SELECTORS:
+                found_cards = soup.select(selector)
+                if len(found_cards) >= 3:
+                    for card in found_cards:
+                        speaker = _extract_speaker_from_card(card, url)
+                        if speaker and speaker.name:
+                            twitter, linkedin = _extract_social_links(card)
+                            speaker.twitter_url = twitter
+                            if linkedin:
+                                speaker.linkedin_url = linkedin
+                            speakers.append(speaker)
+                    break
+
+    except Exception as e:
+        logger.error(f"Playwright scraping failed: {e}")
+        return []
+
+    return _dedupe_speakers(speakers)
+
+
+def _extract_ethcc_speaker(card, source_url: str) -> Optional[Speaker]:
+    """Extract speaker from EthCC-style card (directional-hover-card with profile photo)."""
+    # Get profile image to extract name
+    img = card.find("img", alt=lambda x: x and "Profile photo of" in str(x))
+    if not img:
+        return None
+
+    name = img.get("alt", "").replace("Profile photo of", "").strip()
+    if not name:
+        return None
+
+    # Get text content - format is {track}{name}{org}
+    text = card.get_text(strip=True)
+
+    # Find org - it comes after the name in the text
+    company = None
+    if name in text:
+        idx = text.find(name) + len(name)
+        company = text[idx:].strip()
+
+    # Get social links
+    twitter_url = None
+    linkedin_url = None
+    for link in card.find_all("a", href=True):
+        href = link.get("href", "")
+        if "twitter.com" in href or "x.com" in href:
+            twitter_url = href.strip()
+        elif "linkedin.com" in href:
+            linkedin_url = href.strip()
+
+    return Speaker(
+        name=name,
+        company=company,
+        twitter_url=twitter_url,
+        linkedin_url=linkedin_url,
+        source_url=source_url
+    )
+
+
+def _dedupe_speakers(speakers: list[Speaker]) -> list[Speaker]:
+    """Deduplicate speakers by name."""
+    seen = set()
+    unique = []
+    for s in speakers:
+        key = s.name.lower().strip()
+        if key not in seen:
+            seen.add(key)
+            unique.append(s)
+    logger.info(f"Deduplicated to {len(unique)} unique speakers")
+    return unique
+
+
+def _extract_nextjs_streamed_speakers(html: str, url: str) -> list[Speaker]:
+    """
+    Extract speakers from Next.js React Server Component streamed data.
+    This handles sites like EthCC that stream JSON in script tags.
+    """
+    speakers = []
+
+    # Find displayName, organization, and socialProfiles patterns
+    # Pattern for speaker objects in streamed data
+    speaker_pattern = re.compile(
+        r'"displayName":"([^"]+)".*?"organization":"([^"]*)".*?"trackSlug":"([^"]*)".*?"socialProfiles":\[([^\]]*)\]',
+        re.DOTALL
+    )
+
+    # Also try simpler pattern if the above doesn't match well
+    name_matches = re.findall(r'"displayName":"([^"]+)"', html)
+    org_matches = re.findall(r'"organization":"([^"]+)"', html)
+    social_matches = re.findall(r'"socialProfiles":\[([^\]]*)\]', html)
+
+    if not name_matches:
+        return []
+
+    logger.info(f"Found {len(name_matches)} speakers in Next.js streamed data")
+
+    for i, name in enumerate(name_matches):
+        org = org_matches[i] if i < len(org_matches) else None
+        socials = social_matches[i] if i < len(social_matches) else ""
+
+        # Parse social links
+        twitter_url = None
+        linkedin_url = None
+        social_links = re.findall(r'"(https?://[^"]+)"', socials)
+        for link in social_links:
+            if "twitter.com/" in link or "x.com/" in link:
+                twitter_url = link.strip()
+            elif "linkedin.com/" in link:
+                linkedin_url = link.strip()
+
+        speakers.append(Speaker(
+            name=name,
+            company=org,
+            twitter_url=twitter_url,
+            linkedin_url=linkedin_url,
+            source_url=url
+        ))
+
+    return speakers
+
+
+def _extract_wordpress_paginated_speakers(base_url: str, headers: dict) -> list[Speaker]:
+    """Extract speakers from WordPress sites with paginated speaker archive pages."""
+    speakers = []
+    speaker_urls = set()
+
+    # Parse base URL to construct pagination URLs
+    parsed = urlparse(base_url)
+    base_path = parsed.path.rstrip('/')
+
+    logger.info(f"Checking for WordPress pagination at {base_url}")
+
+    for page in range(1, 50):  # Max 50 pages
+        if page == 1:
+            page_url = base_url
+        else:
+            page_url = f"{parsed.scheme}://{parsed.netloc}{base_path}/page/{page}/"
+
+        try:
+            r = requests.get(page_url, headers=headers, timeout=30, allow_redirects=True)
+            if r.status_code != 200:
+                break
+        except requests.RequestException:
+            break
+
+        # Find individual speaker page URLs
+        matches = re.findall(rf'href="({parsed.scheme}://{parsed.netloc}{base_path}/[^/]+/)"', r.text)
+        new_urls = set(matches) - speaker_urls
+        if not new_urls:
+            break  # No new speakers found
+        speaker_urls.update(new_urls)
+        logger.info(f"Page {page}: {len(new_urls)} new speakers (total: {len(speaker_urls)})")
+
+    if not speaker_urls:
+        return []
+
+    logger.info(f"Found {len(speaker_urls)} speaker pages, scraping...")
+
+    # Scrape individual speaker pages
+    for i, url in enumerate(speaker_urls):
+        if i > 0 and i % 20 == 0:
+            logger.info(f"  Scraped {i}/{len(speaker_urls)} speakers...")
+
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # Try to find name from H1 or title
+            h1 = soup.find("h1")
+            name = h1.get_text(strip=True) if h1 else None
+            if not name:
+                title_tag = soup.find("title")
+                if title_tag:
+                    name = title_tag.get_text(strip=True).split(" - ")[0].strip()
+
+            if not name or len(name) < 2:
+                continue
+
+            # Try to find title/company from various elements
+            title = None
+            company = None
+
+            # Look for common WordPress speaker meta patterns
+            for selector in [".speaker-title", ".job-title", ".position", ".role"]:
+                elem = soup.select_one(selector)
+                if elem:
+                    title = elem.get_text(strip=True)
+                    break
+
+            for selector in [".speaker-company", ".company", ".organization"]:
+                elem = soup.select_one(selector)
+                if elem:
+                    company = elem.get_text(strip=True)
+                    break
+
+            # Find social links
+            twitter_url = None
+            linkedin_url = None
+            for link in soup.find_all("a", href=True):
+                href = link.get("href", "")
+                if "twitter.com/" in href or "x.com/" in href:
+                    twitter_url = href
+                elif "linkedin.com/" in href:
+                    linkedin_url = href
+
+            speakers.append(Speaker(
+                name=name,
+                title=title,
+                company=company,
+                twitter_url=twitter_url,
+                linkedin_url=linkedin_url,
+                source_url=url
+            ))
+
+        except requests.RequestException:
+            continue
+
+    return speakers
 
 
 def _extract_sitemap_speakers(base_url: str, headers: dict) -> list[Speaker]:
@@ -274,13 +588,36 @@ def scrape_speakers(url: str) -> list[Speaker]:
             seen_names.add(normalized_name)
             unique_speakers.append(speaker)
 
-    # If no speakers found, try sitemap extraction (for JS-rendered sites)
-    if len(unique_speakers) <= 1:
-        logger.info("Trying sitemap extraction for JS-rendered site...")
-        sitemap_speakers = _extract_sitemap_speakers(url, headers)
-        if sitemap_speakers:
-            logger.info(f"Extracted {len(sitemap_speakers)} speakers from sitemap")
-            return sitemap_speakers
+    # Check if page might have more content (JS-rendered with infinite scroll)
+    # Indicators: few speakers found, or page has script tags suggesting React/Next.js
+    is_js_heavy = "__NEXT" in response.text or "react" in response.text.lower() or "firebase" in response.text.lower()
+    has_pagination = 'rel="next"' in response.text or "/page/2" in response.text
+
+    # If few speakers or JS-heavy page, try additional extraction methods
+    if len(unique_speakers) <= 50 or (is_js_heavy and len(unique_speakers) < 100):
+        # Try sitemap extraction first (faster, for sites like Coindesk)
+        if len(unique_speakers) <= 5:
+            logger.info("Few speakers found. Trying sitemap extraction...")
+            sitemap_speakers = _extract_sitemap_speakers(url, headers)
+            if sitemap_speakers and len(sitemap_speakers) > len(unique_speakers):
+                logger.info(f"Extracted {len(sitemap_speakers)} speakers from sitemap")
+                return sitemap_speakers
+
+            # Try WordPress pagination
+            if has_pagination:
+                logger.info("WordPress pagination detected. Trying paginated extraction...")
+                wp_speakers = _extract_wordpress_paginated_speakers(url, headers)
+                if wp_speakers and len(wp_speakers) > len(unique_speakers):
+                    logger.info(f"Extracted {len(wp_speakers)} speakers from paginated pages")
+                    return wp_speakers
+
+        # Try Playwright for JS-rendered sites with infinite scroll
+        if PLAYWRIGHT_AVAILABLE and is_js_heavy:
+            logger.info("JS-heavy page detected. Trying Playwright for full content...")
+            playwright_speakers = _scrape_with_playwright(url)
+            if playwright_speakers and len(playwright_speakers) > len(unique_speakers):
+                logger.info(f"Playwright extracted {len(playwright_speakers)} speakers (vs {len(unique_speakers)} initial)")
+                return playwright_speakers
 
     logger.info(f"Extracted {len(unique_speakers)} unique speakers")
     return unique_speakers

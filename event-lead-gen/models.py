@@ -13,6 +13,9 @@ class Speaker:
     company: Optional[str] = None
     source_url: Optional[str] = None
 
+    # Social links (from scraping)
+    twitter_url: Optional[str] = None
+
     # Enrichment fields (populated by Apollo)
     email: Optional[str] = None
     linkedin_url: Optional[str] = None
